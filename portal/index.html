@@ -7,6 +7,35 @@
     <title>Web Console</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style type="text/css">
+        #status-indicator {
+            position: fixed;
+            top: 1rem;
+            left: 1rem;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            z-index: 1000;
+            box-shadow: 0 0 5px rgba(0,0,0,0.3);
+        }
+
+        #reconnection-info {
+            position: fixed;
+            top: calc(1rem + 15px + 5px); /* Below indicator + its height + some margin */
+            left: 1rem;
+            font-size: 0.8em;
+            color: #666;
+            z-index: 1000;
+            display: none; /* Hidden by default */
+        }
+
+        .status-red {
+            background-color: #f44336;
+        }
+
+        .status-green {
+            background-color: #4CAF50;
+        }
+
         div {
             display: block;
         }
@@ -83,7 +112,6 @@
         }
 
         .main {
-            /* padding-top: 3rem; */
             display: flex;
             flex-direction: column;
             justify-content: flex-start;
@@ -162,6 +190,8 @@
 </head>
 
 <body>
+    <div id="status-indicator"></div>
+    <div id="reconnection-info"></div>
     <div class="section main text-center">
         <h1 id="title" style="display: none;">Web Console</h1>
         <a href="/">
@@ -220,14 +250,44 @@
     let commandHistory = [];
     let commandHistoryIdx = 0;
 
+    let statusIndicatorEl;
+    let reconnectionInfoEl;
+    let reconnectionAttempts = 0;
+    let isCurrentlyConnected = false; // Tracks if we are logically connected
+
     function removeLogo() {
         document.getElementById("logo").remove();
         document.getElementById("title").style.display = "block";
     }
 
+    function updateVisuals(state) {
+        switch (state) {
+            case 'connected':
+                statusIndicatorEl.className = 'status-green';
+                document.getElementById("command-button").disabled = false;
+                document.getElementById("command-text").disabled = false;
+                reconnectionInfoEl.style.display = 'none';
+                reconnectionAttempts = 0; // Reset on successful connection
+                break;
+            case 'disconnected': // Covers connecting, disconnected, error visually
+            case 'connecting':
+            case 'error':
+                statusIndicatorEl.className = 'status-red';
+                document.getElementById("command-button").disabled = true;
+                document.getElementById("command-text").disabled = true;
+                if (reconnectionAttempts > 0) {
+                    reconnectionInfoEl.textContent = `Reconnection attempt: ${reconnectionAttempts}`;
+                    reconnectionInfoEl.style.display = 'block';
+                } else {
+                     reconnectionInfoEl.style.display = 'none';
+                }
+                break;
+        }
+    }
+
     function initWebPage() {
-        document.getElementById("command-button").disabled = true;
-        document.getElementById("command-text").disabled = true;
+        statusIndicatorEl = document.getElementById("status-indicator");
+        reconnectionInfoEl = document.getElementById("reconnection-info");
         initCommandHistory();
         initWebSocket();
         initButton();
@@ -244,13 +304,31 @@
         clearTimeout(connectTimeout);
         clearTimeout(pingTimeout);
         pingTimeout = false;
-        connectTimeout = setTimeout(() => {
-            terminalWrite("[WebSerial] Connect timeout.");
-            websocket.close();
-            initWebSocket();
-        }, 3000);
-        terminalWrite("[WebSerial] Connecting...");
+
+        if (!isCurrentlyConnected) { // Only increment if we are truly disconnected and retrying
+            reconnectionAttempts++;
+        }
+        updateVisuals('connecting'); // Show red, update attempt counter if needed
+
+        if (websocket) {
+            websocket.onopen = null;
+            websocket.onclose = null;
+            websocket.onmessage = null;
+            websocket.onerror = null;
+            if (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING) {
+                websocket.close();
+            }
+        }
         websocket = new WebSocket(gateway);
+
+        connectTimeout = setTimeout(() => {
+            if (websocket.readyState === WebSocket.CONNECTING) {
+                console.warn("[WebSerial] Connection attempt timed out.");
+                // No terminalWrite here, let onClose handle "Connection Lost" if it wasn't already logged
+                websocket.close(); // This will trigger onClose
+            }
+        }, 3000);
+
         websocket.onopen = onOpen;
         websocket.onclose = onClose;
         websocket.onmessage = onMessage;
@@ -290,22 +368,41 @@
 
     function onOpen(event) {
         clearTimeout(connectTimeout);
-        terminalWrite("[WebSerial] Connected...");
-        document.getElementById("command-button").disabled = false;
-        document.getElementById("command-text").disabled = false;
+        if (!isCurrentlyConnected) {
+            terminalWrite("[WebSerial] Connected.");
+            isCurrentlyConnected = true;
+        }
+        updateVisuals('connected');
     }
 
     function onError(e) {
-        console.log("[WebSerial] Error!", e);
-        websocket.close();
+        console.error("[WebSerial] WebSocket error:", e);
+        // The "Connection Lost" message will be handled by onClose if we were connected.
+        // Update visuals to disconnected state.
+        // isCurrentlyConnected will be set to false in onClose
+        if (websocket.readyState !== WebSocket.CLOSED && websocket.readyState !== WebSocket.CLOSING) {
+             websocket.close(); // ensure onClose is triggered
+        }
     }
 
     function onClose(e) {
         console.log("[WebSerial] Connection closed.", e);
+        clearTimeout(connectTimeout);
+        clearTimeout(pingTimeout);
+        pingTimeout = false;
+
+        if (isCurrentlyConnected) {
+            terminalWrite("[WebSerial] Connection Lost. Attempting to reconnect...");
+            isCurrentlyConnected = false;
+        }
+        // updateVisuals will be called by initWebSocket with 'connecting' status
+        // which will display the reconnection attempts.
+
+        setTimeout(initWebSocket, 2000);
     }
 
     function onMessage(event) {
-        if (event.data == 'pong') {
+        if (event.data === 'pong') {
             clearTimeout(pingTimeout);
             pingTimeout = false;
         } else {
@@ -314,11 +411,15 @@
     }
 
     function terminalWrite(raw) {
+        let message = raw;
         if (enableTimestamp) {
             let now = new Date();
-            raw = "[" + now.toLocaleTimeString() + "] " + raw + "\n";
+            message = "[" + now.toLocaleTimeString() + "] " + message;
         }
-        textArea.value += raw + "\n";
+        if (!message.endsWith("\n")) {
+            message += "\n";
+        }
+        textArea.value += message;
         if (!enableFlowLock) {
             textArea.scrollTop = textArea.scrollHeight;
         }
@@ -331,28 +432,33 @@
 
     function sendCommand() {
         let cmd = document.getElementById("command-text").value;
-        console.log('send command: ', cmd);
-        websocket.send(cmd);
-        commandHistory.push(cmd);
-        console.log('history size: ', commandHistory.length);
-        if (commandHistory.length > 20) {
-            console.log('history cleanup');
-            commandHistory.splice(0, commandHistory.length - 20);
-            console.log('history size: ', commandHistory.length);
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            console.log('Sending command: ', cmd);
+            websocket.send(cmd);
+            commandHistory.push(cmd);
+            if (commandHistory.length > 20) {
+                commandHistory.splice(0, commandHistory.length - 20);
+            }
+            commandHistoryIdx = commandHistory.length;
+            document.getElementById("command-text").value = "";
+            localStorage.history = JSON.stringify(commandHistory);
+        } else {
+            terminalWrite("[WebSerial] Cannot send command: Not connected.");
         }
-        commandHistoryIdx = commandHistory.length;
-        document.getElementById("command-text").value = "";
-        localStorage.history = JSON.stringify(commandHistory);
     }
 
     setInterval(() => {
-        if (!pingTimeout && websocket.readyState == WebSocket.OPEN) {
-            pingTimeout = setTimeout(() => {
-                terminalWrite("[WebSerial] Ping timeout.");
-                websocket.close();
-                initWebSocket();
-            }, 3000);
-            websocket.send("ping");
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            if (!pingTimeout) {
+                websocket.send("ping");
+                pingTimeout = setTimeout(() => {
+                    console.warn("[WebSerial] Ping timeout.");
+                    // "Connection Lost" will be handled by onClose if we were connected.
+                    if (websocket.readyState !== WebSocket.CLOSED && websocket.readyState !== WebSocket.CLOSING) {
+                        websocket.close(); // Trigger onClose
+                    }
+                }, 3000);
+            }
         }
     }, 2000);
 
